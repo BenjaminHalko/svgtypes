@@ -15,6 +15,10 @@ You can find its changes [documented below](#0161-2026-01-09).
 
 This release has an [MSRV][] of 1.85.
 
+### Fixed
+
+- `SimplifyingPathParser` draws an arc whose radius is more than 10^6 times its chord, or too big to work out, as its chord, and an arc of a huge chord with a few curves. One radius of 6e112 asked for some 10^19 curves (an allocation of 30 GB), one of 1e30 took seconds.
+
 ## [0.16.1][] (2026-01-09)
 
 This release has an [MSRV][] of 1.85.

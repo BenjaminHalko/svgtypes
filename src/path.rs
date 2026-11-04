@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::{Error, Stream};
-use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 
 /// Representation of a path segment.
 ///
@@ -691,6 +691,18 @@ pub enum SimplePathSegment {
     ClosePath,
 }
 
+/// How far the curves an arc is drawn with may stray from it.
+const ARC_TOLERANCE: f64 = 0.1;
+
+/// The least they may stray, as a share of the arc's largest radius: the number of curves grows
+/// with the radius over the tolerance, so an arc of a huge radius is still drawn with a few.
+const ARC_TOLERANCE_OF_RADIUS: f64 = 1e-6;
+
+/// The longest radius an arc is drawn with, in lengths of its chord: past it, the arc bulges
+/// from its chord by less than an eight-millionth of the chord, and its centre is too far away
+/// to be worked out, so it's drawn as the chord.
+const ARC_MOST_RADIUS_OF_CHORD: f64 = 1e6;
+
 /// A simplifying Path Data parser.
 ///
 /// A more high-level Path Data parser on top of [`PathParser`] that provides:
@@ -722,7 +734,7 @@ pub struct SimplifyingPathParser<'a> {
     prev_seg: PathSegment,
     prev_simple_seg: Option<SimplePathSegment>,
 
-    buffer: Vec<SimplePathSegment>,
+    buffer: VecDeque<SimplePathSegment>,
 }
 
 impl<'a> From<&'a str> for SimplifyingPathParser<'a> {
@@ -742,7 +754,7 @@ impl<'a> From<&'a str> for SimplifyingPathParser<'a> {
                 y: 0.0,
             },
             prev_simple_seg: None,
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
         }
     }
 }
@@ -752,7 +764,7 @@ impl Iterator for SimplifyingPathParser<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.buffer.is_empty() {
-            return Some(Ok(self.buffer.remove(0)));
+            return self.buffer.pop_front().map(Ok);
         }
 
         let segment = match self.parser.next()? {
@@ -770,7 +782,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                         x: self.prev_mx,
                         y: self.prev_my,
                     };
-                    self.buffer.push(new_seg);
+                    self.buffer.push_back(new_seg);
                     self.prev_simple_seg = Some(new_seg);
                 }
             }
@@ -790,7 +802,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                     }
                 }
 
-                self.buffer.push(SimplePathSegment::MoveTo { x, y });
+                self.buffer.push_back(SimplePathSegment::MoveTo { x, y });
                 self.prev_seg = segment;
             }
             PathSegment::LineTo { abs, mut x, mut y } => {
@@ -799,7 +811,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                     y += self.prev_y;
                 }
 
-                self.buffer.push(SimplePathSegment::LineTo { x, y });
+                self.buffer.push_back(SimplePathSegment::LineTo { x, y });
                 self.prev_seg = segment;
             }
             PathSegment::HorizontalLineTo { abs, mut x } => {
@@ -808,7 +820,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                 }
 
                 self.buffer
-                    .push(SimplePathSegment::LineTo { x, y: self.prev_y });
+                    .push_back(SimplePathSegment::LineTo { x, y: self.prev_y });
                 self.prev_seg = segment;
             }
             PathSegment::VerticalLineTo { abs, mut y } => {
@@ -817,7 +829,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                 }
 
                 self.buffer
-                    .push(SimplePathSegment::LineTo { x: self.prev_x, y });
+                    .push_back(SimplePathSegment::LineTo { x: self.prev_x, y });
                 self.prev_seg = segment;
             }
             PathSegment::CurveTo {
@@ -838,7 +850,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                     y += self.prev_y;
                 }
 
-                self.buffer.push(SimplePathSegment::CurveTo {
+                self.buffer.push_back(SimplePathSegment::CurveTo {
                     x1,
                     y1,
                     x2,
@@ -885,7 +897,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                     y += self.prev_y;
                 }
 
-                self.buffer.push(SimplePathSegment::CurveTo {
+                self.buffer.push_back(SimplePathSegment::CurveTo {
                     x1,
                     y1,
                     x2,
@@ -918,7 +930,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                 }
 
                 self.buffer
-                    .push(SimplePathSegment::Quadratic { x1, y1, x, y });
+                    .push_back(SimplePathSegment::Quadratic { x1, y1, x, y });
 
                 // Remember as absolute.
                 self.prev_seg = PathSegment::Quadratic {
@@ -952,7 +964,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                 }
 
                 self.buffer
-                    .push(SimplePathSegment::Quadratic { x1, y1, x, y });
+                    .push_back(SimplePathSegment::Quadratic { x1, y1, x, y });
 
                 // Remember as absolute.
                 self.prev_seg = PathSegment::SmoothQuadratic { abs: true, x, y };
@@ -981,22 +993,29 @@ impl Iterator for SimplifyingPathParser<'_> {
                     sweep,
                 };
 
-                match kurbo::Arc::from_svg_arc(&svg_arc) {
-                    Some(arc) => {
-                        arc.to_cubic_beziers(0.1, |p1, p2, p| {
-                            self.buffer.push(SimplePathSegment::CurveTo {
-                                x1: p1.x,
-                                y1: p1.y,
-                                x2: p2.x,
-                                y2: p2.y,
-                                x: p.x,
-                                y: p.y,
-                            });
+                let chord = (x - self.prev_x).hypot(y - self.prev_y);
+                let drawable = |arc: &kurbo::Arc| {
+                    arc.radii.x.max(arc.radii.y) <= chord * ARC_MOST_RADIUS_OF_CHORD
+                };
+                let before = self.buffer.len();
+                if let Some(arc) = kurbo::Arc::from_svg_arc(&svg_arc).filter(drawable) {
+                    let tolerance =
+                        ARC_TOLERANCE.max(arc.radii.x.max(arc.radii.y) * ARC_TOLERANCE_OF_RADIUS);
+                    arc.to_cubic_beziers(tolerance, |p1, p2, p| {
+                        self.buffer.push_back(SimplePathSegment::CurveTo {
+                            x1: p1.x,
+                            y1: p1.y,
+                            x2: p2.x,
+                            y2: p2.y,
+                            x: p.x,
+                            y: p.y,
                         });
-                    }
-                    None => {
-                        self.buffer.push(SimplePathSegment::LineTo { x, y });
-                    }
+                    });
+                }
+                // (No arc, or one that gave no curves, its radius squared past what an f64
+                // holds: its chord.)
+                if self.buffer.len() == before {
+                    self.buffer.push_back(SimplePathSegment::LineTo { x, y });
                 }
 
                 self.prev_seg = segment;
@@ -1006,7 +1025,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                     // Do not add sequential ClosePath segments.
                     // Otherwise it will break markers rendering.
                 } else {
-                    self.buffer.push(SimplePathSegment::ClosePath);
+                    self.buffer.push_back(SimplePathSegment::ClosePath);
                 }
 
                 self.prev_seg = segment;
@@ -1014,7 +1033,7 @@ impl Iterator for SimplifyingPathParser<'_> {
         }
 
         // Remember last position.
-        if let Some(new_segment) = self.buffer.last() {
+        if let Some(new_segment) = self.buffer.back() {
             self.prev_simple_seg = Some(*new_segment);
 
             match *new_segment {
@@ -1048,7 +1067,7 @@ impl Iterator for SimplifyingPathParser<'_> {
             return self.next();
         }
 
-        Some(Ok(self.buffer.remove(0)))
+        self.buffer.pop_front().map(Ok)
     }
 }
 
@@ -1056,6 +1075,7 @@ impl Iterator for SimplifyingPathParser<'_> {
 #[cfg(test)]
 mod simple_tests {
     use super::*;
+    use alloc::{format, vec, vec::Vec};
 
     macro_rules! test {
         ($name:ident, $text:expr, $( $seg:expr ),*) => (
@@ -1215,5 +1235,59 @@ mod simple_tests {
         } else {
             panic!("invalid type");
         }
+    }
+
+    fn simplified(text: &str) -> Vec<SimplePathSegment> {
+        SimplifyingPathParser::from(text).map(|s| s.unwrap()).collect()
+    }
+
+    #[test]
+    fn an_arc_of_a_radius_far_past_its_chord_is_its_chord() {
+        // (A radius of 6e112 asked for some 10^19 curves; 1e30, for 150,000.)
+        for radius in ["6e112", "1e30", "1e9"] {
+            assert_eq!(simplified(&format!("M 160 100 A 60 {radius} 0 0 1 40 100")), vec![
+                SimplePathSegment::MoveTo { x: 160.0, y: 100.0 },
+                SimplePathSegment::LineTo { x: 40.0, y: 100.0 },
+            ], "a radius of {radius}");
+        }
+    }
+
+    #[test]
+    fn an_arc_of_a_huge_chord_is_drawn_with_a_few_curves() {
+        // (At a tolerance of 0.1, some 10^12 curves.)
+        let segs = simplified("M 0 0 A 1e70 1e70 0 1 1 1e65 0");
+        assert!(segs.len() <= 16, "{} segments", segs.len());
+        match segs.last() {
+            Some(SimplePathSegment::CurveTo { x, y, .. }) => {
+                assert!((x / 1e65 - 1.0).abs() < 1e-9 && y.abs() < 1e56, "it ends at ({x}, {y})");
+            }
+            other => panic!("it ends with {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_arc_too_big_to_work_out_is_its_chord() {
+        assert_eq!(simplified("M 0 0 A 1e305 1e305 0 1 1 1e300 0 L 5 5"), vec![
+            SimplePathSegment::MoveTo { x: 0.0, y: 0.0 },
+            SimplePathSegment::LineTo { x: 1e300, y: 0.0 },
+            SimplePathSegment::LineTo { x: 5.0, y: 5.0 },
+        ]);
+    }
+
+    #[test]
+    fn an_arc_of_an_ordinary_radius_keeps_its_tolerance() {
+        // (Below a radius of 100,000 the tolerance is 0.1, as it always was.)
+        let arc = kurbo::Arc::from_svg_arc(&kurbo::SvgArc {
+            from: kurbo::Point::new(0.0, 0.0),
+            to: kurbo::Point::new(2000.0, 0.0),
+            radii: kurbo::Vec2::new(90_000.0, 90_000.0),
+            x_rotation: 0.0,
+            large_arc: true,
+            sweep: true,
+        }).unwrap();
+        let mut want = 0;
+        arc.to_cubic_beziers(0.1, |_, _, _| want += 1);
+        let segs = simplified("M 0 0 A 90000 90000 0 1 1 2000 0");
+        assert_eq!(segs.len() - 1, want, "the curves at a tolerance of 0.1");
     }
 }
